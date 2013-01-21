@@ -30,6 +30,11 @@ try:
 except:
     numpy = None
 
+try:
+    import pandas
+except:
+    pandas = None
+
 import codeutil
 import py3compat
 from importstring import import_item
@@ -141,24 +146,36 @@ class CannedClass(CannedObject):
 
 class CannedArray(CannedObject):
     def __init__(self, obj):
-        self.shape = obj.shape
-        self.dtype = obj.dtype.descr if obj.dtype.fields else obj.dtype.str
-        if sum(obj.shape) == 0:
-            # just pickle it
-            self.buffers = [pickle.dumps(obj, -1)]
-        else:
-            # ensure contiguous
-            obj = numpy.ascontiguousarray(obj, dtype=None)
-            self.buffers = [buffer(obj)]
+        self.info, buf = _can_array(obj)
+        self.buffers = [buf]
     
     def get_object(self, g=None):
-        data = self.buffers[0]
-        if sum(self.shape) == 0:
-            # no shape, we just pickled it
-            return pickle.loads(data)
-        else:
-            return numpy.frombuffer(data, dtype=self.dtype).reshape(self.shape)
+        return _uncan_array(self.info, self.buffers[0])
 
+class CannedPandasSeries(CannedObject):
+    def __init__(self, obj):
+        self.name = obj.name
+        self.data_info, databuf = _can_array(obj.values)
+        self.index_info, indexbuf = _can_array(obj.index)
+        self.buffers = [databuf, indexbuf]
+        
+    def get_object(self, g=None):
+        series_data = _uncan_array(self.data_info, self.buffers[0])
+        series_index = _uncan_array(self.index_info, self.buffers[1])
+        return pandas.Series(series_data, series_index, name=self.name)
+
+class CannedPandasDataFrame(CannedObject):
+    def __init__(self, obj):
+        self.data_info, data_buf = _can_array(obj.values)
+        self.index_info, index_buf = _can_array(obj.index)
+        self.col_info, col_buf = _can_array(obj.columns)
+        self.buffers = [data_buf, index_buf, col_buf]
+
+    def get_object(self, g=None):
+        df_data = _uncan_array(self.data_info, self.buffers[0])
+        df_index = _uncan_array(self.index_info, self.buffers[1])
+        df_cols = _uncan_array(self.col_info, self.buffers[2])
+        return pandas.DataFrame(df_data, df_index, df_cols)
 
 class CannedBytes(CannedObject):
     wrap = bytes
@@ -175,6 +192,27 @@ def CannedBuffer(CannedBytes):
 #-------------------------------------------------------------------------------
 # Functions
 #-------------------------------------------------------------------------------
+
+def _can_array(obj):
+    shape = obj.shape
+    dtype = obj.dtype.descr if obj.dtype.fields else obj.dtype.str
+    info = (shape, dtype)
+    if sum(shape) == 0 or dtype == numpy.dtype(numpy.object).str:
+        # just pickle it
+        return info, pickle.dumps(obj, -1)
+    else:
+        # ensure contiguous
+        obj = numpy.ascontiguousarray(obj, dtype=None)
+        return info, buffer(obj)
+
+def _uncan_array(info, data):
+    shape = info[0]
+    dtype = info[1]
+    if sum(shape) == 0 or dtype == numpy.dtype(numpy.object).str:
+        # no shape, we just pickled it
+        return pickle.loads(data)
+    else:
+        return numpy.frombuffer(data, dtype=dtype).reshape(shape)
 
 def _logger():
     """get the logger for the current Application
@@ -310,6 +348,8 @@ def uncan_sequence(obj, g=None):
 can_map = {
     'IPython.parallel.dependent' : lambda obj: CannedObject(obj, keys=('f','df')),
     'numpy.ndarray' : CannedArray,
+    'pandas.Series' : CannedPandasSeries,
+    'pandas.DataFrame' : CannedPandasDataFrame,
     FunctionType : CannedFunction,
     bytes : CannedBytes,
     buffer : CannedBuffer,
